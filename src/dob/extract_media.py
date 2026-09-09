@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import shutil
+import tempfile
 from pathlib import Path
 
 from .config import BotConfig
@@ -40,11 +41,12 @@ class MediaExtractor:
 
     async def extract(self, item: IngestItem, progress) -> Extracted:
         src = Path(item.local_path)  # type: ignore[arg-type]
-        wav = src.with_name(src.stem + ".16k.wav")
         duration = await probe_duration(src)
         await progress.update("converting", f"{src.name} ({duration / 60:.1f} min)")
-        await to_wav(src, wav)
-        try:
+        # Never write next to the source: inbox/ and bind mounts may be read-only.
+        with tempfile.TemporaryDirectory(prefix="dob-") as tmp:
+            wav = Path(tmp) / "audio.16k.wav"
+            await to_wav(src, wav)
             loop = asyncio.get_running_loop()
 
             def on_progress(fraction: float, detail: str) -> None:
@@ -53,8 +55,6 @@ class MediaExtractor:
                 )
 
             t = await self.transcriber.transcribe(wav, progress=on_progress)
-        finally:
-            wav.unlink(missing_ok=True)
         if not t.segments:
             raise UnsupportedTypeError("no speech detected")
         duration = t.duration_s or duration

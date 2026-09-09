@@ -1,4 +1,4 @@
-# CUDA 12.4 + cuDNN 9 runtime: what ctranslate2 (faster-whisper) >= 4.5 and torch cu124 expect.
+# CUDA 12.x + cuDNN 9 runtime: what ctranslate2 (faster-whisper) >= 4.5 and torch cu126 expect.
 # Mixing cuDNN versions (e.g. a cudnn8 base + torch's cuDNN 9) crashes ctranslate2, so keep this pairing.
 FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
 
@@ -22,10 +22,13 @@ WORKDIR /app
 COPY pyproject.toml README.md ./
 COPY src ./src
 
-# torch/torchaudio/torchcodec from the CUDA 12.4 index first, then the project with the gpu extra.
+# torch/torchaudio/torchcodec from the CUDA 12.6 index (works with any 12.6+ driver; the default
+# PyPI wheels are built for CUDA 13 and fail on older drivers). The extra index on the second
+# install keeps the resolver from swapping them for PyPI builds.
+ARG TORCH_INDEX=https://download.pytorch.org/whl/cu126
 RUN pip install -U pip \
-    && pip install --index-url https://download.pytorch.org/whl/cu124 torch torchaudio torchcodec \
-    && pip install -e ".[gpu]"
+    && pip install --index-url ${TORCH_INDEX} torch torchaudio torchcodec \
+    && pip install --extra-index-url ${TORCH_INDEX} -e ".[gpu]"
 
 # The vault is a bind mount owned by the host user; make git not care.
 RUN git config --system safe.directory '*' \
