@@ -53,8 +53,16 @@ def slugify(s: str, max_len: int = 60) -> str:
 
 
 def safe_name(s: str, max_len: int = 80) -> str:
+    """Filesystem-safe title: slashes become hyphens ("50/50" -> "50-50"), other reserved
+    characters are dropped, and truncation happens on a word boundary."""
+    s = re.sub(r"\s*[/\\]\s*", "-", s)
     s = _WS.sub(" ", _BAD_CHARS.sub("", s)).strip(" .")
-    return s[:max_len].strip(" .") or "untitled"
+    if len(s) > max_len:
+        cut = s[:max_len]
+        if " " in cut[max_len // 2 :]:
+            cut = cut[: cut.rfind(" ")]
+        s = cut
+    return s.strip(" .-") or "untitled"
 
 
 def hms(seconds: float) -> str:

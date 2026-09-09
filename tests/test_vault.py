@@ -60,7 +60,12 @@ def _structured(**kw):
 
 def test_helpers():
     assert slugify("Hello, World! 2026") == "hello-world-2026"
-    assert safe_name('a/b\\c:d*e?f"g<h>i|j') == "abcdefghij"
+    assert safe_name('a:b*c?d"e<f>g|h') == "abcdefgh"
+    assert safe_name("Split equity 50/50") == "Split equity 50-50"
+    assert safe_name("Company rename and domain search after Blueharbor unavailable", 60) == (
+        "Company rename and domain search after Blueharbor"
+    )
+    assert safe_name("x" * 100, 60) == "x" * 60
 
 
 def test_write_creates_everything(tmp_vault):
