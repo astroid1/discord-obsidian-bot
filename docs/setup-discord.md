@@ -16,7 +16,7 @@
 1. Open **OAuth2 → URL Generator**.
 2. Scopes: `bot` and `applications.commands`.
 3. Bot permissions: **View Channels, Send Messages, Send Messages in Threads, Read Message History,
-   Add Reactions, Embed Links**. (This is permission integer `277025508416`; no admin needed.)
+   Add Reactions, Embed Links**. (This is permission integer `274877992000`; no admin needed.)
 4. Open the generated URL, pick your server, authorize.
 
 If you later add channels the bot cannot see, give its role access in the channel's permission
