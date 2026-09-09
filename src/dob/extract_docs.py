@@ -12,7 +12,7 @@ from .models import Extracted, IngestItem
 log = logging.getLogger(__name__)
 
 IMAGE_EXT = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
-SCANNED_THRESHOLD = 200  # chars; below this a PDF is treated as image-only
+SCANNED_CHARS_PER_PAGE = 40  # below this average, a PDF is treated as image-only (scanned)
 PDF_LLM_MAX_MB = 32
 
 
@@ -24,7 +24,10 @@ class PdfExtractor:
         p = Path(item.local_path)  # type: ignore[arg-type]
         pages, text = await asyncio.to_thread(self._read, p)
         meta = {"format": "pdf"}
-        if len(text.strip()) < SCANNED_THRESHOLD and self.structurer is not None:
+        if (
+            len(text.strip()) < SCANNED_CHARS_PER_PAGE * max(pages, 1)
+            and self.structurer is not None
+        ):
             if p.stat().st_size > PDF_LLM_MAX_MB * 1024 * 1024:
                 raise UnsupportedTypeError("scanned PDF too large for vision fallback")
             await progress.update("reading scanned pdf", p.name)
