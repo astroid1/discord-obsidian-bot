@@ -1,0 +1,525 @@
+"""Discord surface: intents, watched channels, reactions and replies, slash commands, schedulers."""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import logging
+import re
+import shutil
+import signal
+import sys
+import time
+from datetime import date
+from pathlib import Path
+
+import discord
+from discord import app_commands
+
+from .chat import ChatArchiver
+from .config import BotConfig, Settings
+from .fetch import canonical_ref, classify_url
+from .jobs import JobQueue, LogSink
+from .models import INTERACTIVE, DiscordRef, IngestItem, RunResult
+from .pipeline import Pipeline
+
+log = logging.getLogger(__name__)
+
+URL_RE = re.compile(r"https?://[^\s<>()]+")
+MSG_LINK_RE = re.compile(r"https://(?:\w+\.)?discord(?:app)?\.com/channels/(\d+)/(\d+)/(\d+)")
+EDIT_INTERVAL = 5.0
+REPLY_MAX = 1900
+
+
+def _trim(s: str, n: int = REPLY_MAX) -> str:
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+class DiscordSink:
+    """Progress sink that reacts on the source message and edits one reply."""
+
+    def __init__(self, message: discord.Message, label: str):
+        self.message = message
+        self.label = label
+        self.reply: discord.Message | None = None
+        self._last = 0.0
+
+    async def _edit(self, text: str, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and now - self._last < EDIT_INTERVAL:
+            return
+        self._last = now
+        with contextlib.suppress(discord.HTTPException):
+            if self.reply is None:
+                self.reply = await self.message.reply(_trim(text), mention_author=False)
+            else:
+                await self.reply.edit(content=_trim(text))
+
+    async def _react(self, emoji: str, remove: str | None = None) -> None:
+        with contextlib.suppress(discord.HTTPException):
+            if remove and self.message.guild and self.message.guild.me:
+                await self.message.remove_reaction(remove, self.message.guild.me)
+            await self.message.add_reaction(emoji)
+
+    async def queued(self, position: int) -> None:
+        await self._react("⏳")
+        await self._edit(f"⏳ Queued (#{position}): **{self.label}**", force=True)
+
+    async def update(self, stage: str, detail: str = "", fraction: float | None = None) -> None:
+        pct = f" {fraction * 100:.0f}%" if fraction is not None else ""
+        await self._edit(f"⏳ {stage}{pct} · {detail} — **{self.label}**")
+
+    async def done(self, result: RunResult) -> None:
+        if result.status == "skipped":
+            await self._react("🔁", remove="⏳")
+            await self._edit(f"🔁 **{self.label}** — {result.message}", force=True)
+            return
+        n = result.note
+        assert n is not None
+        await self._react("✅", remove="⏳")
+        counts = []
+        if n.entities_created or n.entities_updated:
+            counts.append(f"{len(n.entities_created) + len(n.entities_updated)} entities")
+        if n.decisions_created:
+            counts.append(f"{len(n.decisions_created)} decisions")
+        tail = f" · {' · '.join(counts)}" if counts else ""
+        await self._edit(f"✅ **{n.title}**\n{result.summary}\n`{n.note_path}`{tail}", force=True)
+
+    async def failed(self, error: str, will_retry: bool) -> None:
+        if will_retry:
+            await self._edit(f"⚠️ **{self.label}** — {error}\nRetrying…", force=True)
+            return
+        await self._react("❌", remove="⏳")
+        await self._edit(
+            f"❌ **{self.label}** — {error}\nFix the input and use `/retry` with the message link.",
+            force=True,
+        )
+
+
+class InboxSink(LogSink):
+    """Moves inbox files to done/ or failed/ after processing."""
+
+    def __init__(self, path: Path, inbox: Path):
+        super().__init__(path.name)
+        self.path = path
+        self.inbox = inbox
+
+    def _move(self, sub: str) -> None:
+        dest = self.inbox / sub
+        dest.mkdir(exist_ok=True)
+        with contextlib.suppress(OSError):
+            shutil.move(str(self.path), str(dest / self.path.name))
+
+    async def done(self, result: RunResult) -> None:
+        await super().done(result)
+        self._move("done")
+
+    async def failed(self, error: str, will_retry: bool) -> None:
+        await super().failed(error, will_retry)
+        if not will_retry:
+            self._move("failed")
+
+
+class Bot(discord.Client):
+    def __init__(self, settings: Settings, cfg: BotConfig, pipeline: Pipeline):
+        intents = discord.Intents.none()
+        intents.guilds = True
+        intents.guild_messages = True
+        intents.message_content = True
+        super().__init__(intents=intents)
+        self.settings = settings
+        self.cfg = cfg
+        self.pipeline = pipeline
+        self.queue = JobQueue(pipeline)
+        self.archiver = ChatArchiver(
+            client=self, state=pipeline.state, cfg=cfg, vault=pipeline.vault, queue=self.queue
+        )
+        self.tree = app_commands.CommandTree(self)
+        self._started = False
+        self._tasks: list[asyncio.Task] = []
+        self._inbox_seen: dict[Path, int] = {}
+        self._register_commands()
+
+    # --- lifecycle -----------------------------------------------------------------------
+
+    async def setup_hook(self) -> None:
+        guild = discord.Object(id=self.cfg.guild_id)
+        self.tree.copy_global_to(guild=guild)
+        await self.tree.sync(guild=guild)
+
+    async def on_ready(self) -> None:
+        log.info("logged in as %s (guild %s)", self.user, self.cfg.guild_id)
+        if self._started:
+            return
+        self._started = True
+        self.queue.start()
+        await self._requeue()
+        self._tasks.append(asyncio.create_task(self._inbox_loop(), name="inbox"))
+        self._tasks.append(asyncio.create_task(self._sync_loop(), name="sync"))
+
+    async def close(self) -> None:
+        for t in self._tasks:
+            t.cancel()
+        await self.queue.stop()
+        await super().close()
+
+    async def _requeue(self) -> None:
+        for item in self.pipeline.state.inflight():
+            sink = None
+            if item.discord:
+                with contextlib.suppress(discord.HTTPException, AttributeError):
+                    ch = self.get_channel(item.discord.channel_id) or await self.fetch_channel(
+                        item.discord.channel_id
+                    )
+                    msg = await ch.fetch_message(item.discord.message_id)  # type: ignore[union-attr]
+                    sink = DiscordSink(msg, item.original_name)
+            await self.queue.submit(item, sink, persist=False)
+
+    # --- message handling --------------------------------------------------------------------
+
+    def _watched(self, channel) -> bool:
+        if channel.id in self.cfg.watched_channels:
+            return True
+        parent = getattr(channel, "parent", None)
+        return parent is not None and parent.id in self.cfg.watched_channels
+
+    async def on_message(self, message: discord.Message) -> None:
+        if message.author.bot or message.guild is None or message.guild.id != self.cfg.guild_id:
+            return
+        if not self._watched(message.channel):
+            return
+        await self._ingest_message(message, force=False)
+
+    async def _ingest_message(self, message: discord.Message, *, force: bool) -> int:
+        ref = DiscordRef(
+            guild_id=message.guild.id,  # type: ignore[union-attr]
+            channel_id=message.channel.id,
+            channel_name=getattr(message.channel, "name", str(message.channel.id)),
+            message_id=message.id,
+            author_id=message.author.id,
+            author_name=self.cfg.people.get(message.author.id) or message.author.display_name,
+            jump_url=message.jump_url,
+            created_at=message.created_at,
+        )
+        supported = self.pipeline.extractors.supported_extensions()
+        n = 0
+        unsupported: list[str] = []
+        for a in message.attachments:
+            if not self.pipeline.extractors.supports(a.filename):
+                unsupported.append(a.filename)
+                continue
+            item = IngestItem(
+                source="discord_attachment",
+                original_name=a.filename,
+                source_ref=f"discord:{message.id}:{a.id}",
+                url=a.url,
+                mime=a.content_type,
+                discord=ref,
+                priority=INTERACTIVE,
+                force=force,
+            )
+            await self.queue.submit(item, DiscordSink(message, a.filename))
+            n += 1
+        for url in URL_RE.findall(message.content or ""):
+            url = url.rstrip(".,;:!?)")
+            if classify_url(url, self.cfg.url_hosts, supported) is None:
+                continue
+            item = IngestItem(
+                source="discord_url",
+                original_name=url,
+                source_ref=canonical_ref(url),
+                url=url,
+                discord=ref,
+                priority=INTERACTIVE,
+                force=force,
+            )
+            await self.queue.submit(item, DiscordSink(message, url))
+            n += 1
+        if unsupported and not n:
+            with contextlib.suppress(discord.HTTPException):
+                await message.reply(
+                    f"Skipping {', '.join(unsupported[:5])} — unsupported type. I can read: "
+                    + " ".join(sorted(supported)),
+                    mention_author=False,
+                )
+        return n
+
+    # --- background loops --------------------------------------------------------------------
+
+    async def _inbox_loop(self) -> None:
+        inbox = self.settings.inbox_path
+        inbox.mkdir(parents=True, exist_ok=True)
+        (inbox / "done").mkdir(exist_ok=True)
+        (inbox / "failed").mkdir(exist_ok=True)
+        log.info("watching inbox %s every %ss", inbox, self.settings.inbox_poll_seconds)
+        pending: dict[Path, int] = {}
+        while True:
+            try:
+                for p in sorted(inbox.iterdir()):
+                    if not p.is_file() or p.name.startswith(".") or p in self._inbox_seen:
+                        continue
+                    size = p.stat().st_size
+                    if pending.get(p) == size and size > 0:
+                        del pending[p]
+                        self._inbox_seen[p] = size
+                        if not self.pipeline.extractors.supports(p.name):
+                            log.warning("inbox: unsupported file %s", p.name)
+                            shutil.move(str(p), str(inbox / "failed" / p.name))
+                            continue
+                        item = IngestItem(
+                            source="inbox",
+                            original_name=p.name,
+                            source_ref=f"inbox:{p.name}",
+                            local_path=p,
+                            priority=INTERACTIVE,
+                        )
+                        await self.queue.submit(item, InboxSink(p, inbox))
+                    else:
+                        pending[p] = size
+                for p in list(self._inbox_seen):
+                    if not p.exists():
+                        del self._inbox_seen[p]
+            except Exception:  # noqa: BLE001
+                log.exception("inbox loop error")
+            await asyncio.sleep(self.settings.inbox_poll_seconds)
+
+    async def _sync_loop(self) -> None:
+        if not self.cfg.archived_channels:
+            return
+        interval = max(0.25, self.cfg.sync_interval_hours) * 3600
+        while True:
+            try:
+                totals = await self.archiver.walk()
+                log.info(
+                    "chat sync: %s", {k: v for k, v in totals.items() if v} or "no new messages"
+                )
+            except Exception:  # noqa: BLE001
+                log.exception("chat sync failed")
+            await asyncio.sleep(interval)
+
+    # --- slash commands ----------------------------------------------------------------------
+
+    def _allowed(self, inter: discord.Interaction) -> bool:
+        u = inter.user
+        if u.id in self.cfg.allowed_user_ids:
+            return True
+        if isinstance(u, discord.Member):
+            if u.guild_permissions.administrator:
+                return True
+            if any(r.id in self.cfg.allowed_role_ids for r in u.roles):
+                return True
+        return False
+
+    async def _gate(self, inter: discord.Interaction) -> bool:
+        if inter.guild_id != self.cfg.guild_id or not self._allowed(inter):
+            await inter.response.send_message("You are not allowed to run this.", ephemeral=True)
+            return False
+        return True
+
+    async def _message_from_link(self, link: str) -> discord.Message | None:
+        m = MSG_LINK_RE.search(link)
+        if not m:
+            return None
+        _, cid, mid = (int(x) for x in m.groups())
+        ch = self.get_channel(cid) or await self.fetch_channel(cid)
+        return await ch.fetch_message(mid)  # type: ignore[union-attr]
+
+    def _register_commands(self) -> None:
+        tree = self.tree
+
+        @tree.command(name="status", description="Queue, ledger and archive status")
+        async def status(inter: discord.Interaction) -> None:
+            if not await self._gate(inter):
+                return
+            st = self.pipeline.state
+            counts = st.counts()
+            cur = self.queue.current.original_name if self.queue.current else "idle"
+            lines = [
+                f"**Queue:** {self.queue.size()} · current: {cur}",
+                f"**Ledger:** {counts or 'empty'}",
+            ]
+            cursors = st.cursors()
+            if cursors:
+                lines.append(
+                    f"**Archive:** {len(cursors)} channel/thread cursors, last sync {max(c['last_synced_at'] or '' for c in cursors)}"
+                )
+            for r in st.recent(5):
+                lines.append(
+                    f"· {r['status']} — {r['original_name']} {('→ ' + r['note_path']) if r['note_path'] else (r['error'] or '')}"
+                )
+            await inter.response.send_message(_trim("\n".join(lines)), ephemeral=True)
+
+        @tree.command(
+            name="backfill",
+            description="Archive full history of the configured channels (or one channel)",
+        )
+        @app_commands.describe(channel="Only this channel", since="Start date YYYY-MM-DD")
+        async def backfill(
+            inter: discord.Interaction,
+            channel: discord.TextChannel | None = None,
+            since: str | None = None,
+        ) -> None:
+            if not await self._gate(inter):
+                return
+            since_d = None
+            if since:
+                try:
+                    since_d = date.fromisoformat(since)
+                except ValueError:
+                    await inter.response.send_message("since must be YYYY-MM-DD", ephemeral=True)
+                    return
+            await inter.response.send_message(
+                "⏳ Backfill started; I'll report here when done.", ephemeral=True
+            )
+
+            async def report(text: str) -> None:
+                with contextlib.suppress(discord.HTTPException):
+                    await inter.followup.send(text, ephemeral=True)
+
+            ids = [channel.id] if channel else None
+            try:
+                totals = await self.archiver.walk(
+                    channel_ids=ids, since=since_d, full=True, report=report
+                )
+            except Exception as e:  # noqa: BLE001
+                log.exception("backfill failed")
+                await report(f"❌ backfill failed: {e}")
+                return
+            await report(
+                "✅ Backfill done: " + ", ".join(f"<#{k}>: {v:,}" for k, v in totals.items())
+            )
+
+        @tree.command(name="sync", description="Archive new messages since the last sync")
+        async def sync(inter: discord.Interaction) -> None:
+            if not await self._gate(inter):
+                return
+            await inter.response.defer(ephemeral=True)
+            totals = await self.archiver.walk()
+            await inter.followup.send(
+                "✅ "
+                + (
+                    ", ".join(f"<#{k}>: {v:,}" for k, v in totals.items() if v) or "no new messages"
+                ),
+                ephemeral=True,
+            )
+
+        @tree.command(
+            name="ingest", description="Ingest a URL (YouTube, Loom, Drive, direct file link)"
+        )
+        async def ingest(inter: discord.Interaction, url: str) -> None:
+            if not await self._gate(inter):
+                return
+            if (
+                classify_url(
+                    url, self.cfg.url_hosts, self.pipeline.extractors.supported_extensions()
+                )
+                is None
+            ):
+                await inter.response.send_message(
+                    "That URL is not on the allowed host list and has no supported file extension.",
+                    ephemeral=True,
+                )
+                return
+            await inter.response.send_message(f"⏳ Queued {url}", ephemeral=False)
+            msg = await inter.original_response()
+            ref = DiscordRef(
+                guild_id=inter.guild_id or 0, channel_id=inter.channel_id or 0, channel_name=getattr(inter.channel, "name", ""),
+                message_id=msg.id, author_id=inter.user.id, author_name=self.cfg.people.get(inter.user.id) or inter.user.display_name,
+                jump_url=msg.jump_url, created_at=msg.created_at,
+            )  # fmt: skip
+            item = IngestItem(
+                source="discord_url",
+                original_name=url,
+                source_ref=canonical_ref(url),
+                url=url,
+                discord=ref,
+                priority=INTERACTIVE,
+            )
+            await self.queue.submit(item, DiscordSink(msg, url))
+
+        async def _re(inter: discord.Interaction, link: str, force: bool) -> None:
+            if not await self._gate(inter):
+                return
+            try:
+                msg = await self._message_from_link(link)
+            except discord.HTTPException:
+                msg = None
+            if msg is None:
+                await inter.response.send_message(
+                    "Could not find that message (paste a message link).", ephemeral=True
+                )
+                return
+            n = await self._ingest_message(msg, force=force)
+            await inter.response.send_message(
+                f"Queued {n} item(s) from that message."
+                if n
+                else "Nothing ingestible on that message.",
+                ephemeral=True,
+            )
+
+        @tree.command(name="retry", description="Retry a failed drop (paste the message link)")
+        async def retry(inter: discord.Interaction, link: str) -> None:
+            await _re(inter, link, False)
+
+        @tree.command(name="reingest", description="Re-run a drop even if it was already ingested")
+        async def reingest(inter: discord.Interaction, link: str) -> None:
+            await _re(inter, link, True)
+
+
+# --- entry points ------------------------------------------------------------------------------
+
+
+def _install_signal_handlers(client: discord.Client) -> None:
+    if sys.platform == "win32":
+        return
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, lambda: asyncio.ensure_future(client.close()))
+
+
+async def run_bot(settings: Settings, cfg: BotConfig, pipeline: Pipeline) -> None:
+    if not settings.discord_token:
+        raise SystemExit("DISCORD_TOKEN is not set (see .env.example)")
+    bot = Bot(settings, cfg, pipeline)
+    _install_signal_handlers(bot)
+    async with bot:
+        await bot.start(settings.discord_token)
+
+
+async def run_oneshot(
+    settings: Settings,
+    cfg: BotConfig,
+    pipeline: Pipeline,
+    *,
+    mode: str,
+    channel: int | None,
+    since: str | None,
+) -> None:
+    """`dob backfill` / `dob sync`: connect, walk history, drain digest jobs, exit."""
+    if not settings.discord_token:
+        raise SystemExit("DISCORD_TOKEN is not set (see .env.example)")
+
+    class OneShot(Bot):
+        async def setup_hook(self) -> None:  # no command sync needed
+            pass
+
+        async def on_ready(self) -> None:
+            if self._started:
+                return
+            self._started = True
+            self.queue.start()
+            try:
+                totals = await self.archiver.walk(
+                    channel_ids=[channel] if channel else None,
+                    since=date.fromisoformat(since) if since else None,
+                    full=(mode == "backfill"),
+                )
+                log.info("%s done: %s", mode, totals)
+                while self.queue.size():
+                    await asyncio.sleep(2)
+            finally:
+                await self.close()
+
+    bot = OneShot(settings, cfg, pipeline)
+    async with bot:
+        await bot.start(settings.discord_token)

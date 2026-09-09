@@ -1,0 +1,33 @@
+# --- secrets & local config (never commit) ---
+.env
+.env.*
+!.env.example
+config.yaml
+config.*.yaml
+!config.example.yaml
+
+# --- editor / machine-local ---
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# --- runtime data (created by the bot) ---
+data/
+inbox/
+models/
+tmp-vault/
+*.log
+
+# --- python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+build/
+dist/

@@ -1,0 +1,13 @@
+[
+  {"id": 1, "channel_id": 20, "author_id": 100, "author_name": "jordan", "created_at": "2026-09-08T13:14:00+00:00",
+   "content": "Morning — did the vendor reply?", "jump_url": "https://discord.com/channels/1/20/1"},
+  {"id": 2, "channel_id": 20, "author_id": 101, "author_name": "marko", "created_at": "2026-09-08T13:16:00+00:00",
+   "content": "Not yet, chasing today.", "reply_to_id": 1, "jump_url": "https://discord.com/channels/1/20/2"},
+  {"id": 3, "channel_id": 20, "author_id": 100, "author_name": "jordan", "created_at": "2026-09-08T13:20:00+00:00",
+   "content": "", "attachments": [{"id": 30, "filename": "contract-v2.pdf", "url": "https://cdn/contract-v2.pdf", "size": 1000}],
+   "jump_url": "https://discord.com/channels/1/20/3"},
+  {"id": 4, "channel_id": 20, "author_id": 999, "author_name": "guest", "created_at": "2026-09-08T14:00:00+00:00",
+   "content": "hi", "jump_url": "https://discord.com/channels/1/20/4"},
+  {"id": 5, "channel_id": 20, "thread_id": 500, "thread_name": "Pricing page copy", "author_id": 100, "author_name": "jordan",
+   "created_at": "2026-09-08T15:02:00+00:00", "content": "first draft", "jump_url": "https://discord.com/channels/1/500/5"}
+]

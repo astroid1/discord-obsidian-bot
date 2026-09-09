@@ -1,0 +1,57 @@
+# Copy to config.yaml and edit. config.yaml is gitignored because it contains your server's IDs.
+# Get IDs: Discord -> User Settings -> Advanced -> Developer Mode, then right-click -> Copy ID.
+
+# The single server this bot serves. Messages from any other server are ignored.
+guild_id: 123456789012345678
+
+# Channels where dropped files and links are ingested into the vault.
+watched_channels:
+  - 123456789012345678   # #drops
+  - 123456789012345678   # #meetings
+
+# Channels whose chat history is archived (raw daily logs + LLM digests).
+archived_channels:
+  - 123456789012345678   # #general
+  - 123456789012345678   # #dev
+
+# Who may run slash commands (/backfill, /sync, /ingest, /retry, /reingest, /status).
+# Anyone in a watched channel may drop files regardless of this list.
+allowed_role_ids: []
+allowed_user_ids:
+  - 123456789012345678
+
+# Map Discord user ids to canonical people names. Seeds people/ notes and makes chat logs link authors.
+people:
+  "123456789012345678": "Jordan Blake"
+
+# URL hosts the bot will download from when a link is posted in a watched channel.
+# Any URL whose path ends in a supported file extension is also accepted.
+url_hosts:
+  - youtube.com
+  - youtu.be
+  - loom.com
+  - drive.google.com
+  - docs.google.com
+
+# IANA timezone used for chat day boundaries and timestamps in logs.
+timezone: America/New_York
+
+# Chat archiving
+sync_interval_hours: 6      # incremental history sync cadence
+digest_min_messages: 5      # a day needs at least this many messages to get an LLM digest
+digest_regen_delta: 10      # re-digest an already digested day if it grew by this many messages
+
+# Ingestion tunables
+memo_max_minutes: 5         # audio shorter than this is a "memo", longer is a "recording"
+
+llm:
+  single_call_max_chars: 400000   # above this, transcripts are chunked (map) and merged (reduce)
+  chunk_chars: 200000
+  chunk_overlap_chars: 2000
+
+transcription:
+  language: null              # e.g. "en"; null = auto-detect
+  diarize: true               # only takes effect when HF_TOKEN is set
+
+vault:
+  keep_originals_max_mb: 25   # copy non-media originals into vault/attachments/ up to this size

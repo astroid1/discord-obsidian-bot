@@ -1,0 +1,17 @@
+.git
+.venv
+venv
+data
+inbox
+models
+tmp-vault
+.env
+config.yaml
+.vscode
+.idea
+__pycache__
+*.pyc
+.pytest_cache
+.ruff_cache
+tests
+docs
