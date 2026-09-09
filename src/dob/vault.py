@@ -416,7 +416,12 @@ class VaultWriter:
             body = body.rstrip() + "\n\n## Mentions\n"
         body = body.rstrip("\n") + "\n" + bullet + "\n"
         if "updated" in meta or meta.get("type") in ENTITY_FOLDER:
-            meta["updated"] = when.isoformat()
+            # Sources are not ingested in chronological order; keep created/updated monotonic.
+            prev = str(meta.get("updated") or "")
+            meta["updated"] = max(prev, when.isoformat())
+            first = str(meta.get("created") or "")
+            if first and when.isoformat() < first:
+                meta["created"] = when.isoformat()
         path.write_text(dump_note(meta, body), encoding="utf-8")
 
     def _keep_original(self, extracted: Extracted) -> str | None:

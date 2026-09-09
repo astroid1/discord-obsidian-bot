@@ -20,7 +20,8 @@ ENV PATH="/opt/venv/bin:$PATH"
 
 WORKDIR /app
 COPY pyproject.toml README.md ./
-COPY src ./src
+# A stub package so the dependency layer can be built (and cached) before the real source is copied.
+RUN mkdir -p src/dob && touch src/dob/__init__.py
 
 # torch/torchaudio/torchcodec from the CUDA 12.6 index (works with any 12.6+ driver; the default
 # PyPI wheels are built for CUDA 13 and fail on older drivers). The extra index on the second
@@ -29,6 +30,10 @@ ARG TORCH_INDEX=https://download.pytorch.org/whl/cu126
 RUN pip install -U pip \
     && pip install --index-url ${TORCH_INDEX} torch torchaudio torchcodec \
     && pip install --extra-index-url ${TORCH_INDEX} -e ".[gpu]"
+
+# Real source last: code changes only rebuild from here.
+COPY src ./src
+RUN pip install --no-deps -e .
 
 # The vault is a bind mount owned by the host user; make git not care.
 RUN git config --system safe.directory '*' \

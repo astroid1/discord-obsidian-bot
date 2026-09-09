@@ -180,3 +180,25 @@ def test_recording_note_and_discord_meta(tmp_vault):
         and meta["duration"] == "00:01:02"
     )
     assert "[00:00:00] SPEAKER_00: hello" in body and "[00:01:01] bye" in body
+
+
+def test_entity_dates_stay_monotonic(tmp_vault):
+    from datetime import UTC, datetime
+
+    def ref(day):
+        return DiscordRef(
+            guild_id=1, channel_id=2, channel_name="c", message_id=day, author_id=4,
+            author_name="a", jump_url="https://discord.com/channels/1/2/3",
+            created_at=datetime(2026, 9, day, 12, 0, tzinfo=UTC),
+        )  # fmt: skip
+
+    ents = [EntityOut(type="person", name="Sam", aliases=[], role_in_source="x", is_new=True)]
+    tmp_vault.write(
+        _extracted(sha="a1" * 32, discord=ref(8)), _structured(entities=ents, decisions=[])
+    )
+    tmp_vault.write(
+        _extracted(sha="b2" * 32, discord=ref(1)),
+        _structured(suggested_title="Older", entities=ents, decisions=[]),
+    )
+    meta, _ = load_note(tmp_vault.root / "people" / "Sam.md")
+    assert meta["created"] == "2026-09-01" and meta["updated"] == "2026-09-08"
