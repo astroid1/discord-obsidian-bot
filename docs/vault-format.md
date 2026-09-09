@@ -69,7 +69,7 @@ tags: []
 ---
 # Jordan Blake
 
-Founder of Acme Co.        ← written once from the model's one-line description
+Founder of Acme.        ← written once from the model's one-line description
 
 ## Mentions
 - 2026-09-08 — [[sources/recordings/2026-09-08 weekly-sync|Weekly sync]] — led the pricing discussion
