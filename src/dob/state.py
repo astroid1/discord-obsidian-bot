@@ -72,6 +72,11 @@ CREATE TABLE IF NOT EXISTS chat_days (
   digest_message_count INTEGER,
   PRIMARY KEY (channel_id, day)
 );
+
+CREATE TABLE IF NOT EXISTS kv (
+  key TEXT PRIMARY KEY,
+  value TEXT
+);
 """
 
 
@@ -339,4 +344,19 @@ class State:
             self._db.execute(
                 "UPDATE chat_days SET digest_path=?, digest_message_count=? WHERE channel_id=? AND day=?",
                 (digest_path, message_count, channel_id, day),
+            )
+
+    # --- key/value ----------------------------------------------------------------
+
+    def get_kv(self, key: str) -> str | None:
+        with self._lock:
+            row = self._db.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
+        return row["value"] if row else None
+
+    def set_kv(self, key: str, value: str) -> None:
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO kv(key, value) VALUES (?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, value),
             )

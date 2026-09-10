@@ -264,6 +264,65 @@ class VaultWriter:
         result.commit_sha = self.commit(f"ingest: {title}")
         return result
 
+    # --- decisions recorded by hand (/decide) -------------------------------------------
+
+    def write_decision(
+        self,
+        *,
+        title: str,
+        statement: str,
+        rationale: str | None = None,
+        alternatives: str | None = None,
+        decided_by: list[str] | tuple[str, ...] = (),
+        when: date,
+        source_url: str | None = None,
+    ) -> tuple[str, bool]:
+        """Create a decision page from `/decide`, or add a "Reaffirmed" mention to an existing
+        one with the same title. Returns (vault-relative path, created)."""
+        self.ensure_layout()
+        title = safe_name(title, 80)
+        stamp = when.isoformat()
+        ref = f" [↗]({source_url})" if source_url else ""
+        existing = self._find_decision(title)
+        if existing:
+            path = self.root / existing.path
+            meta, body = load_note(path)
+            if not (source_url and source_url in body):
+                if "## Mentions" not in body:
+                    body = body.rstrip() + "\n\n## Mentions\n"
+                body = body.rstrip("\n") + f"\n- {stamp} — Reaffirmed via Discord{ref}\n"
+                path.write_text(dump_note(meta, body), encoding="utf-8")
+                self.commit(f"decision: reaffirm {title}")
+            return self.rel(path), False
+
+        def who(name: str) -> str:
+            r = self._lookup_any(name)
+            return link(r.name) if r else name
+
+        path = self.root / "decisions" / f"{stamp} {slugify(title)}.md"
+        if path.exists():
+            path = path.with_name(f"{path.stem}-{len(self.entity_context().decisions) + 1}.md")
+        meta = {
+            "type": "decision",
+            "title": title,
+            "decided_on": stamp,
+            "status": "decided",
+            "decided_by": [who(n) for n in decided_by if n.strip()],
+            "source": source_url or "manual",
+            "tags": [],
+        }
+        body = f"# {title}\n\n## Statement\n{statement.strip()}\n"
+        if rationale and rationale.strip():
+            body += f"\n## Rationale\n{rationale.strip()}\n"
+        if alternatives and alternatives.strip():
+            body += f"\n## Alternatives considered\n{alternatives.strip()}\n"
+        body += f"\n## Mentions\n- {stamp} — Decided via Discord{ref}\n"
+        path.write_text(dump_note(meta, body), encoding="utf-8")
+        self._invalidate()
+        self.regenerate_home()
+        self.commit(f"decision: {title}")
+        return self.rel(path), True
+
     # --- chat logs (used by chat.py) -----------------------------------------------------
 
     def write_chat_log(self, channel_name: str, day: str, meta: dict, body: str) -> str:

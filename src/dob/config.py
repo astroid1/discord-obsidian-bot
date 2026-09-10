@@ -58,6 +58,23 @@ class VaultConfig(BaseModel):
     keep_originals_max_mb: int = 25
 
 
+class AskConfig(BaseModel):
+    """How much of the vault `/ask` shows Claude."""
+
+    max_notes: int = 12
+    budget_chars: int = 120_000
+    note_chars: int = 12_000
+
+
+class WeeklyDigestConfig(BaseModel):
+    """Scheduled week-in-review post. Disabled until `channel_id` is set."""
+
+    channel_id: int | None = None
+    weekday: int = Field(default=0, ge=0, le=6)  # 0 = Monday
+    hour: int = Field(default=8, ge=0, le=23)  # in `timezone`
+    days: int = Field(default=7, ge=1, le=60)
+
+
 class BotConfig(BaseModel):
     """Server-specific configuration from config.yaml. Contains IDs, never secrets."""
 
@@ -73,6 +90,9 @@ class BotConfig(BaseModel):
     digest_min_messages: int = 5
     digest_regen_delta: int = 10
     memo_max_minutes: float = 5
+    decisions_channel_id: int | None = None  # where /decide posts (default: where it was run)
+    ask: AskConfig = Field(default_factory=AskConfig)
+    weekly_digest: WeeklyDigestConfig = Field(default_factory=WeeklyDigestConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)
     transcription: TranscriptionConfig = Field(default_factory=TranscriptionConfig)
     vault: VaultConfig = Field(default_factory=VaultConfig)

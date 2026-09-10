@@ -14,7 +14,7 @@ archived_channels:
   - 123456789012345678   # #general
   - 123456789012345678   # #dev
 
-# Who may run slash commands (/backfill, /sync, /ingest, /retry, /reingest, /status).
+# Who may run slash commands (/ask, /decide, /digest, /backfill, /sync, /ingest, /retry, /reingest, /status).
 # Anyone in a watched channel may drop files regardless of this list.
 allowed_role_ids: []
 allowed_user_ids:
@@ -43,6 +43,22 @@ digest_regen_delta: 10      # re-digest an already digested day if it grew by th
 
 # Ingestion tunables
 memo_max_minutes: 5         # audio shorter than this is a "memo", longer is a "recording"
+
+# Where /decide posts the decision card (default: the channel the command was run in).
+decisions_channel_id: 123456789012345678   # #key-decisions
+
+# /ask: how much of the vault Claude sees per question.
+ask:
+  max_notes: 12
+  budget_chars: 120000
+  note_chars: 12000
+
+# Scheduled week-in-review post. Leave channel_id unset to disable. /digest builds one on demand.
+weekly_digest:
+  channel_id: 123456789012345678   # #announcements
+  weekday: 0        # 0 = Monday ... 6 = Sunday, in `timezone`
+  hour: 8
+  days: 7
 
 llm:
   single_call_max_chars: 400000   # above this, transcripts are chunked (map) and merged (reduce)

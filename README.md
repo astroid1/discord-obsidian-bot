@@ -134,6 +134,9 @@ archived channel, threads included. After that the bot syncs new messages every
 | attachment in a watched channel | audio/video → transcript; pdf/docx/md/txt/csv/json → text; png/jpg/webp → Claude vision description + OCR |
 | link in a watched channel | YouTube / Loom / Google Drive via yt-dlp, Google Docs/Sheets/Slides via export, or any direct link to a supported file type |
 | file in `inbox/` | same pipeline, bypasses Discord's upload limit; moved to `inbox/done/` or `inbox/failed/` |
+| `/ask question:` | answer from the vault, citing the notes it used (needs `ANTHROPIC_API_KEY`) |
+| `/decide title: what: [why:] [alternatives:] [decided_by:]` | post a decision card to `decisions_channel_id` and create the decision page |
+| `/digest [days:] [post:]` | week-in-review from the vault; `post:true` sends it to `weekly_digest.channel_id`, which also happens on the configured weekday/hour |
 | `/ingest url:` | ingest a link from anywhere |
 | `/retry link:` / `/reingest link:` | rerun a failed drop, or force a re-run of a done one |
 | `/status` | queue, ledger counts, archive cursors |

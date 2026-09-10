@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- `/ask`: keyword retrieval over the vault plus a Claude answer that cites the notes it used.
+- `/decide`: records a decision as a card in the decisions channel and a page in `decisions/`;
+  the same title again appends a "Reaffirmed" mention instead of a duplicate page.
+- `/digest` and a scheduled week-in-review post (`weekly_digest` in config.yaml) built from
+  frontmatter dates, written up by Claude when a key is set.
+- New config: `decisions_channel_id`, `ask`, `weekly_digest`. New `kv` table in the state db.
+
 ## 0.1.0 — 2026-09-08
 
 Initial release.

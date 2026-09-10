@@ -10,12 +10,13 @@ import shutil
 import signal
 import sys
 import time
-from datetime import date
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import discord
 from discord import app_commands
 
+from .ask import collect_week, next_run, render_week, split_message
 from .chat import ChatArchiver
 from .config import BotConfig, Settings
 from .fetch import canonical_ref, classify_url
@@ -138,6 +139,19 @@ class Bot(discord.Client):
         self._started = False
         self._tasks: list[asyncio.Task] = []
         self._inbox_seen: dict[Path, int] = {}
+        self.answerer = None
+        if settings.anthropic_api_key:
+            from .ask import Answerer
+
+            self.answerer = Answerer(
+                api_key=settings.anthropic_api_key,
+                model=settings.anthropic_model,
+                vault_root=pipeline.vault.root,
+                tz=cfg.tz,
+                max_notes=cfg.ask.max_notes,
+                budget_chars=cfg.ask.budget_chars,
+                note_chars=cfg.ask.note_chars,
+            )
         self._register_commands()
 
     # --- lifecycle -----------------------------------------------------------------------
@@ -156,6 +170,7 @@ class Bot(discord.Client):
         await self._requeue()
         self._tasks.append(asyncio.create_task(self._inbox_loop(), name="inbox"))
         self._tasks.append(asyncio.create_task(self._sync_loop(), name="sync"))
+        self._tasks.append(asyncio.create_task(self._weekly_loop(), name="weekly"))
 
     async def close(self) -> None:
         for t in self._tasks:
@@ -296,6 +311,48 @@ class Bot(discord.Client):
             except Exception:  # noqa: BLE001
                 log.exception("chat sync failed")
             await asyncio.sleep(interval)
+
+    async def _weekly_loop(self) -> None:
+        wd = self.cfg.weekly_digest
+        if not wd.channel_id:
+            return
+        while True:
+            now = datetime.now(self.cfg.tz)
+            nxt = next_run(now, wd.weekday, wd.hour)
+            log.info("weekly digest scheduled for %s", nxt.isoformat(timespec="minutes"))
+            await asyncio.sleep(max(1.0, (nxt - now).total_seconds()))
+            key = nxt.date().isoformat()
+            if self.pipeline.state.get_kv("weekly_digest_last") == key:
+                continue
+            try:
+                text = await self.build_week(wd.days)
+                await self._send_long(await self._channel(wd.channel_id), text)
+                self.pipeline.state.set_kv("weekly_digest_last", key)
+            except Exception:  # noqa: BLE001
+                log.exception("weekly digest failed")
+                await asyncio.sleep(3600)
+
+    # --- helpers shared by commands and loops ------------------------------------------------
+
+    async def _channel(self, channel_id: int):
+        return self.get_channel(channel_id) or await self.fetch_channel(channel_id)
+
+    async def _send_long(self, channel, text: str) -> None:
+        for chunk in split_message(text):
+            await channel.send(chunk)
+
+    def _person(self, user) -> str:
+        return self.cfg.people.get(user.id) or user.display_name
+
+    async def build_week(self, days: int) -> str:
+        """Week-in-review text: Claude-written when configured, plain rendering otherwise."""
+        today = datetime.now(self.cfg.tz).date()
+        week = await asyncio.to_thread(
+            collect_week, self.pipeline.vault.root, since=today - timedelta(days=days), until=today
+        )
+        if self.answerer is not None:
+            return await self.answerer.weekly(week)
+        return render_week(week)
 
     # --- slash commands ----------------------------------------------------------------------
 
@@ -456,6 +513,105 @@ class Bot(discord.Client):
                 else "Nothing ingestible on that message.",
                 ephemeral=True,
             )
+
+        @tree.command(name="ask", description="Ask the knowledge base a question")
+        @app_commands.describe(question="What do you want to know?")
+        async def ask(inter: discord.Interaction, question: str) -> None:
+            if not await self._gate(inter):
+                return
+            if self.answerer is None:
+                await inter.response.send_message(
+                    "ANTHROPIC_API_KEY is not set, so /ask is disabled.", ephemeral=True
+                )
+                return
+            await inter.response.defer(thinking=True)
+            try:
+                answer, notes = await self.answerer.ask(question, asked_by=self._person(inter.user))
+            except Exception as e:  # noqa: BLE001
+                log.exception("/ask failed")
+                await inter.followup.send(_trim(f"❌ {type(e).__name__}: {e}"))
+                return
+            log.info("/ask by %s: %d note(s) used", inter.user, len(notes))
+            for chunk in split_message(f"**Q:** {question.strip()}\n{answer}"):
+                await inter.followup.send(chunk)
+
+        @tree.command(
+            name="decide", description="Record a decision in the decisions channel and the vault"
+        )
+        @app_commands.describe(
+            title="Short imperative title, e.g. 'Price by quote above 50 seats'",
+            what="What was decided",
+            why="Why (rationale)",
+            alternatives="Options considered and rejected",
+            decided_by="Names, comma separated (default: you)",
+        )
+        async def decide(
+            inter: discord.Interaction,
+            title: str,
+            what: str,
+            why: str | None = None,
+            alternatives: str | None = None,
+            decided_by: str | None = None,
+        ) -> None:
+            if not await self._gate(inter):
+                return
+            await inter.response.defer(ephemeral=True)
+            names = [n.strip() for n in (decided_by or "").split(",") if n.strip()] or [
+                self._person(inter.user)
+            ]
+            when = datetime.now(self.cfg.tz).date()
+            cid = self.cfg.decisions_channel_id or inter.channel_id or 0
+            lines = [f"📌 **Decision: {title.strip()}**", f"**What:** {what.strip()}"]
+            if why:
+                lines.append(f"**Why:** {why.strip()}")
+            if alternatives:
+                lines.append(f"**Alternatives considered:** {alternatives.strip()}")
+            lines.append(f"**Decided by:** {', '.join(names)} · {when.isoformat()}")
+            text = "\n".join(lines)
+            try:
+                posted = await (await self._channel(cid)).send(_trim(text))
+            except discord.HTTPException as e:
+                await inter.followup.send(f"❌ Could not post in <#{cid}>: {e}", ephemeral=True)
+                return
+            rel, created = await asyncio.to_thread(
+                self.pipeline.vault.write_decision,
+                title=title,
+                statement=what,
+                rationale=why,
+                alternatives=alternatives,
+                decided_by=names,
+                when=when,
+                source_url=posted.jump_url,
+            )
+            with contextlib.suppress(discord.HTTPException):
+                await posted.edit(content=_trim(f"{text}\n`{rel}`"))
+            verb = "✅ Recorded" if created else "🔁 Already on file; linked this message to"
+            await inter.followup.send(f"{verb} `{rel}` and posted in <#{cid}>.", ephemeral=True)
+
+        @tree.command(name="digest", description="Build the week-in-review now (preview or post)")
+        @app_commands.describe(
+            days="Look back this many days (default 7)",
+            post="Post to the announcements channel instead of a private preview",
+        )
+        async def digest(
+            inter: discord.Interaction, days: app_commands.Range[int, 1, 60] = 7, post: bool = False
+        ) -> None:
+            if not await self._gate(inter):
+                return
+            await inter.response.defer(ephemeral=True, thinking=True)
+            try:
+                text = await self.build_week(days)
+            except Exception as e:  # noqa: BLE001
+                log.exception("/digest failed")
+                await inter.followup.send(_trim(f"❌ {type(e).__name__}: {e}"), ephemeral=True)
+                return
+            if post:
+                cid = self.cfg.weekly_digest.channel_id or inter.channel_id or 0
+                await self._send_long(await self._channel(cid), text)
+                await inter.followup.send(f"✅ Posted in <#{cid}>.", ephemeral=True)
+                return
+            for chunk in split_message(text):
+                await inter.followup.send(chunk, ephemeral=True)
 
         @tree.command(name="retry", description="Retry a failed drop (paste the message link)")
         async def retry(inter: discord.Interaction, link: str) -> None:
