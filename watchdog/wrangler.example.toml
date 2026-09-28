@@ -1,0 +1,18 @@
+# Copy to wrangler.toml (gitignored) and fill in your account and KV namespace ids:
+#   npx wrangler kv namespace create watchdog
+#   printf %s "$(openssl rand -hex 32)" | npx wrangler secret put HEARTBEAT_TOKEN
+#   printf %s "https://discord.com/api/webhooks/..." | npx wrangler secret put DISCORD_WEBHOOK_URL
+#   npx wrangler deploy
+name = "dob-watchdog"
+main = "src/index.js"
+compatibility_date = "2026-09-01"
+account_id = "YOUR_ACCOUNT_ID"
+
+kv_namespaces = [{ binding = "STATE", id = "YOUR_KV_NAMESPACE_ID" }]
+
+[triggers]
+crons = ["*/5 * * * *"]
+
+[vars]
+GRACE_MINUTES = "15"   # alert after this long without a heartbeat (or 3x the bot's interval)
+REMIND_HOURS = "12"    # repeat the alert this often while it stays down

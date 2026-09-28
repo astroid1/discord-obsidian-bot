@@ -188,6 +188,7 @@ class Bot(discord.Client):
         self._tasks.append(asyncio.create_task(self._sync_loop(), name="sync"))
         self._tasks.append(asyncio.create_task(self._weekly_loop(), name="weekly"))
         self._tasks.append(asyncio.create_task(self._task_reminder_loop(), name="tasks"))
+        self._tasks.append(asyncio.create_task(self._heartbeat_loop(), name="heartbeat"))
 
     async def close(self) -> None:
         if self._rec is not None:
@@ -626,6 +627,44 @@ class Bot(discord.Client):
         left_ours = before.channel is not None and before.channel.id == rec.channel.id
         if left_ours and not [m for m in rec.channel.members if not m.bot]:
             await self._stop_recording("everyone left")
+
+    async def _heartbeat_loop(self) -> None:
+        """Tell the external watchdog we are alive; it alerts when these stop arriving."""
+        s = self.settings
+        if not s.heartbeat_url or not s.heartbeat_token:
+            return
+        import httpx
+
+        interval = max(60, s.heartbeat_interval_sec)
+        started = time.monotonic()
+        failures = 0
+        async with httpx.AsyncClient(timeout=15) as http:
+            while True:
+                info = {
+                    "queue": self.queue.size(),
+                    "recording": bool(self._rec),
+                    "uptime_min": int((time.monotonic() - started) / 60),
+                }
+                try:
+                    r = await http.post(
+                        s.heartbeat_url,
+                        headers={"authorization": f"Bearer {s.heartbeat_token}"},
+                        json={
+                            "service": s.heartbeat_service,
+                            "label": s.heartbeat_label,
+                            "intervalSec": interval,
+                            "info": info,
+                        },
+                    )
+                    r.raise_for_status()
+                    if failures:
+                        log.info("heartbeat recovered after %d failure(s)", failures)
+                    failures = 0
+                except Exception as e:  # noqa: BLE001 - never let monitoring take the bot down
+                    failures += 1
+                    if failures in (1, 10) or failures % 100 == 0:
+                        log.warning("heartbeat failed (%d): %s", failures, e)
+                await asyncio.sleep(interval)
 
     async def _task_reminder_loop(self) -> None:
         tc = self.cfg.tasks

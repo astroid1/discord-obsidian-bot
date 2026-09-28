@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Heartbeat loop plus `watchdog/`, a Cloudflare Worker dead-man's switch that alerts a Discord
+  webhook when the bot goes silent and again when it recovers.
+- Compose project name pinned so Docker volume names no longer depend on the folder name.
 - `/record start|stop|status`: capture a voice channel with discord-ext-voice-recv, one PCM track
   per speaker on a shared timeline, DAVE (end-to-end encrypted voice) frames decrypted through the
   connection's davey session. Each track is transcribed alone and merged, so speaker labels are

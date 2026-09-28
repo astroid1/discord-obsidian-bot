@@ -1,3 +1,5 @@
+name: discord-obsidian-bot  # pinned so volume names never depend on the folder name
+
 services:
   bot:
     build: .

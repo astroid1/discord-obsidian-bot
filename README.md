@@ -166,6 +166,14 @@ python scripts/smoke.py tests/fixtures/sample.md --vault ./tmp-vault --fake-llm 
   link). Its body text is never rewritten, so your hand edits survive.
 - Decisions that reaffirm a known decision are appended to it rather than duplicated.
 
+## Knowing when it is down
+
+A bot cannot report its own death, so `watchdog/` is a tiny Cloudflare Worker that does it from
+outside. The bot POSTs a heartbeat every 5 minutes (`HEARTBEAT_URL`, `HEARTBEAT_TOKEN` in `.env`);
+a cron in the Worker posts to a Discord webhook when heartbeats stop for 15 minutes, repeats every
+12 hours while it stays down, and posts again when it recovers. Setup steps are at the top of
+`watchdog/wrangler.example.toml`. Free-tier Workers and KV are plenty.
+
 ## Security notes for running in the open
 
 - Secrets live only in `.env`; server IDs only in `config.yaml`; both are gitignored and CI runs

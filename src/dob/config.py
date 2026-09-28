@@ -38,6 +38,13 @@ class Settings(BaseSettings):
     whisper_device: str = "auto"
     whisper_compute_type: str = "int8_float16"
 
+    # Dead-man's switch (see watchdog/): POST a heartbeat here every interval. Empty = off.
+    heartbeat_url: str = ""
+    heartbeat_token: str = ""
+    heartbeat_service: str = "discord-obsidian-bot"
+    heartbeat_label: str = "Knowledge-base bot"
+    heartbeat_interval_sec: int = 300
+
     log_level: str = "INFO"
     inbox_poll_seconds: int = 10
     inbox_force_polling: bool = True

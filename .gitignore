@@ -31,3 +31,7 @@ venv/
 .mypy_cache/
 build/
 dist/
+
+# Watchdog deploy config (account and KV ids)
+watchdog/wrangler.toml
+watchdog/.wrangler/
