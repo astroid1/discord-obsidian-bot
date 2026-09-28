@@ -12,6 +12,7 @@ import sys
 import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import discord
 from discord import app_commands
@@ -23,6 +24,17 @@ from .fetch import canonical_ref, classify_url
 from .jobs import JobQueue, LogSink
 from .models import INTERACTIVE, DiscordRef, IngestItem, RunResult
 from .pipeline import Pipeline
+from .tasks import (
+    DUE_HELP,
+    Task,
+    parse_due,
+    render_board,
+    render_card,
+    render_reminder,
+    render_vault_page,
+    suggestions_from,
+    week_tasks_line,
+)
 
 log = logging.getLogger(__name__)
 
@@ -127,6 +139,8 @@ class Bot(discord.Client):
         intents.guilds = True
         intents.guild_messages = True
         intents.message_content = True
+        intents.guild_reactions = True
+        intents.voice_states = True
         super().__init__(intents=intents)
         self.settings = settings
         self.cfg = cfg
@@ -139,6 +153,8 @@ class Bot(discord.Client):
         self._started = False
         self._tasks: list[asyncio.Task] = []
         self._inbox_seen: dict[Path, int] = {}
+        self._rec: SimpleNamespace | None = None
+        self.queue.on_result = self._on_result
         self.answerer = None
         if settings.anthropic_api_key:
             from .ask import Answerer
@@ -171,8 +187,12 @@ class Bot(discord.Client):
         self._tasks.append(asyncio.create_task(self._inbox_loop(), name="inbox"))
         self._tasks.append(asyncio.create_task(self._sync_loop(), name="sync"))
         self._tasks.append(asyncio.create_task(self._weekly_loop(), name="weekly"))
+        self._tasks.append(asyncio.create_task(self._task_reminder_loop(), name="tasks"))
 
     async def close(self) -> None:
+        if self._rec is not None:
+            with contextlib.suppress(Exception):
+                await self._stop_recording("bot shutting down")
         for t in self._tasks:
             t.cancel()
         await self.queue.stop()
@@ -351,8 +371,286 @@ class Bot(discord.Client):
             collect_week, self.pipeline.vault.root, since=today - timedelta(days=days), until=today
         )
         if self.answerer is not None:
-            return await self.answerer.weekly(week)
-        return render_week(week)
+            text = await self.answerer.weekly(week)
+        else:
+            text = render_week(week)
+        tasks_line = week_tasks_line(self._all_tasks(), today)
+        return f"{text}\n\n{tasks_line}" if tasks_line else text
+
+    # --- tasks -------------------------------------------------------------------------------
+
+    def _today(self) -> date:
+        return datetime.now(self.cfg.tz).date()
+
+    def _all_tasks(self) -> list[Task]:
+        return [Task.from_row(r) for r in self.pipeline.state.list_tasks()]
+
+    def _task(self, task_id: int) -> Task | None:
+        row = self.pipeline.state.get_task(task_id)
+        return Task.from_row(row) if row else None
+
+    async def _task_channel(self, fallback: int | None = None):
+        cid = self.cfg.tasks.channel_id or fallback
+        return await self._channel(cid) if cid else None
+
+    async def _post_card(self, task: Task, fallback_channel: int | None) -> Task:
+        ch = await self._task_channel(fallback_channel)
+        if ch is None:
+            return task
+        msg = await ch.send(render_card(task, self._today()))
+        self.pipeline.state.update_task(task.id, message_id=msg.id, source_url=msg.jump_url)
+        if task.status == "suggested":
+            for emoji in ("✅", "❌"):
+                with contextlib.suppress(discord.HTTPException):
+                    await msg.add_reaction(emoji)
+        return self._task(task.id) or task
+
+    async def _refresh_card(self, task: Task) -> None:
+        if not task.message_id:
+            return
+        ch = await self._task_channel()
+        if ch is None:
+            return
+        with contextlib.suppress(discord.HTTPException):
+            msg = await ch.fetch_message(task.message_id)
+            await msg.edit(content=render_card(task, self._today()))
+
+    async def _refresh_board(self) -> None:
+        ch = await self._task_channel()
+        if ch is None:
+            return
+        text = _trim(render_board(self._all_tasks(), self._today()))
+        st = self.pipeline.state
+        mid = st.get_kv("tasks_board_message_id")
+        if mid:
+            with contextlib.suppress(discord.HTTPException, ValueError):
+                msg = await ch.fetch_message(int(mid))
+                await msg.edit(content=text)
+                return
+        msg = await ch.send(text)
+        st.set_kv("tasks_board_message_id", str(msg.id))
+        with contextlib.suppress(discord.HTTPException):
+            await msg.pin(reason="task board")
+
+    async def _after_task_change(self, task: Task) -> None:
+        await self._refresh_card(task)
+        await self._refresh_board()
+        page = render_vault_page(self._all_tasks(), self._today())
+        try:
+            await asyncio.to_thread(self.pipeline.vault.write_tasks_page, page)
+        except Exception:  # noqa: BLE001 - the vault mirror is best-effort
+            log.exception("could not write tasks page")
+
+    async def _close_task(self, task: Task, status: str, by: str) -> Task:
+        self.pipeline.state.update_task(
+            task.id, status=status, done_at=datetime.now(self.cfg.tz).isoformat(timespec="seconds")
+        )
+        log.info("task #%d %s by %s", task.id, status, by)
+        updated = self._task(task.id) or task
+        await self._after_task_change(updated)
+        return updated
+
+    async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent) -> None:
+        """✅ on an open card closes it; ✅/❌ on a suggested card accepts/dismisses it."""
+        emoji = str(payload.emoji)
+        if (
+            emoji not in ("✅", "❌")
+            or payload.guild_id != self.cfg.guild_id
+            or payload.channel_id != self.cfg.tasks.channel_id
+            or payload.member is None
+            or payload.member.bot
+        ):
+            return
+        row = self.pipeline.state.task_by_message(payload.message_id)
+        if not row:
+            return
+        task = Task.from_row(row)
+        if task.status not in ("open", "suggested"):
+            return
+        m = payload.member
+        allowed = (
+            m.id in self.cfg.allowed_user_ids
+            or m.guild_permissions.administrator
+            or any(r.id in self.cfg.allowed_role_ids for r in m.roles)
+            or m.id == task.assignee_id
+        )
+        if not allowed:
+            return
+        if task.status == "suggested":
+            if emoji == "✅":
+                self.pipeline.state.update_task(task.id, status="open")
+                log.info("suggested task #%d accepted by %s", task.id, self._person(m))
+                await self._after_task_change(self._task(task.id) or task)
+            else:
+                await self._close_task(task, "cancelled", self._person(m))
+            return
+        if emoji == "✅":
+            await self._close_task(task, "done", self._person(m))
+
+    # --- suggested tasks from new notes ---------------------------------------------------
+
+    async def _on_result(self, item: IngestItem, result: RunResult) -> None:
+        if item.source == "meeting" and item.local_path:
+            await asyncio.to_thread(shutil.rmtree, Path(item.local_path).parent, True)
+        note = result.note
+        tc = self.cfg.tasks
+        if note is None or not tc.channel_id or not tc.suggest_from_notes:
+            return
+        if note.kind not in tc.suggest_kinds or not note.action_items:
+            return
+        st = self.pipeline.state
+        fresh = [
+            s
+            for s in suggestions_from(
+                note.action_items, self.cfg.people, self._today(), limit=tc.suggest_max_per_note
+            )
+            if not st.task_exists(note.note_path, s.title)
+        ]
+        if not fresh:
+            return
+        ch = await self._task_channel()
+        if ch is None:
+            return
+        src = f"[{note.title}]({item.discord.jump_url})" if item.discord else f"**{note.title}**"
+        n = len(fresh)
+        await ch.send(
+            f"💡 {n} suggested task{'s' if n != 1 else ''} from {src}. "
+            "React ✅ to accept or ❌ to dismiss."
+        )
+        for s in fresh:
+            tid = st.add_task(
+                title=s.title,
+                notes=f"From: {note.title}",
+                assignee_id=s.owner_id,
+                assignee_name=s.owner_name,
+                due=s.due,
+                created_by="Knowledge-base bot",
+                status="suggested",
+                source_note=note.note_path,
+            )
+            task = self._task(tid)
+            if task is not None:
+                await self._post_card(task, None)
+        log.info("suggested %d task(s) from %s", n, note.note_path)
+
+    # --- meeting capture ------------------------------------------------------------------
+
+    async def _start_recording(self, channel, user, text_channel_id: int) -> None:
+        from discord.ext import voice_recv
+
+        from .record import TrackWriter, install_dave_decrypt, make_sink, new_recording_dir
+
+        root = new_recording_dir(self.settings.data_path / "recordings")
+        writer = TrackWriter(root, names=dict(self.cfg.people))
+        vc = await channel.connect(cls=voice_recv.VoiceRecvClient, self_deaf=False, self_mute=True)
+        try:
+            vc.listen(make_sink(writer))
+            install_dave_decrypt(vc)
+        except Exception:
+            await vc.disconnect(force=True)
+            shutil.rmtree(root, ignore_errors=True)
+            raise
+        self._rec = SimpleNamespace(
+            vc=vc,
+            writer=writer,
+            channel=channel,
+            requester_id=user.id,
+            requested_by=self._person(user),
+            text_channel_id=text_channel_id,
+            timer=None,
+        )
+        self._rec.timer = asyncio.create_task(self._recording_timeout(), name="record-timeout")
+        log.info("recording #%s into %s", channel.name, root)
+        if self.cfg.meetings.announce:
+            with contextlib.suppress(discord.HTTPException):
+                await channel.send(
+                    f"🔴 **This voice channel is being recorded** by {self._person(user)} for "
+                    "meeting notes. Leave the channel if you do not consent. `/record stop` ends it."
+                )
+
+    async def _recording_timeout(self) -> None:
+        await asyncio.sleep(self.cfg.meetings.max_minutes * 60)
+        await self._stop_recording(f"{self.cfg.meetings.max_minutes}-minute limit")
+
+    async def _stop_recording(self, reason: str, status_channel_id: int | None = None) -> None:
+        rec, self._rec = self._rec, None
+        if rec is None:
+            return
+        if rec.timer is not None and rec.timer is not asyncio.current_task():
+            rec.timer.cancel()
+        with contextlib.suppress(Exception):
+            rec.vc.stop_listening()
+        with contextlib.suppress(Exception):
+            await rec.vc.disconnect(force=True)
+        manifest = await asyncio.to_thread(
+            rec.writer.finish, channel=rec.channel.name, requested_by=rec.requested_by
+        )
+        minutes = rec.writer.elapsed() / 60
+        ch = await self._channel(status_channel_id or rec.text_channel_id)
+        if not rec.writer.tracks:
+            await ch.send(f"⏹ Recording of <#{rec.channel.id}> stopped ({reason}). Nobody spoke.")
+            await asyncio.to_thread(shutil.rmtree, manifest.parent, True)
+            return
+        names = ", ".join(t.name for t in rec.writer.tracks.values())
+        msg = await ch.send(
+            f"⏹ Recording of <#{rec.channel.id}> stopped ({reason}) · {minutes:.0f} min · {names}. "
+            "Transcribing…"
+        )
+        ref = DiscordRef(
+            guild_id=self.cfg.guild_id,
+            channel_id=msg.channel.id,
+            channel_name=getattr(msg.channel, "name", str(msg.channel.id)),
+            message_id=msg.id,
+            author_id=rec.requester_id,
+            author_name=rec.requested_by,
+            jump_url=msg.jump_url,
+            created_at=msg.created_at,
+        )
+        item = IngestItem(
+            source="meeting",
+            original_name=f"Meeting in #{rec.channel.name}",
+            source_ref=f"meeting:{manifest.parent.name}",
+            local_path=manifest,
+            discord=ref,
+            priority=INTERACTIVE,
+        )
+        await self.queue.submit(item, DiscordSink(msg, f"meeting in #{rec.channel.name}"))
+
+    async def on_voice_state_update(self, member, before, after) -> None:
+        rec = self._rec
+        if rec is None:
+            return
+        if self.user and member.id == self.user.id and after.channel is None:
+            await self._stop_recording("bot was disconnected")
+            return
+        left_ours = before.channel is not None and before.channel.id == rec.channel.id
+        if left_ours and not [m for m in rec.channel.members if not m.bot]:
+            await self._stop_recording("everyone left")
+
+    async def _task_reminder_loop(self) -> None:
+        tc = self.cfg.tasks
+        if not tc.channel_id:
+            return
+        while True:
+            now = datetime.now(self.cfg.tz)
+            nxt = now.replace(hour=tc.reminder_hour, minute=0, second=0, microsecond=0)
+            if nxt <= now:
+                nxt += timedelta(days=1)
+            await asyncio.sleep(max(1.0, (nxt - now).total_seconds()))
+            key = nxt.date().isoformat()
+            if tc.reminder_weekdays_only and nxt.weekday() >= 5:
+                continue
+            if self.pipeline.state.get_kv("tasks_reminder_last") == key:
+                continue
+            try:
+                text = render_reminder(self._all_tasks(), nxt.date())
+                if text:
+                    await self._send_long(await self._channel(tc.channel_id), text)
+                    await self._refresh_board()
+                self.pipeline.state.set_kv("tasks_reminder_last", key)
+            except Exception:  # noqa: BLE001
+                log.exception("task reminder failed")
+                await asyncio.sleep(600)
 
     # --- slash commands ----------------------------------------------------------------------
 
@@ -612,6 +910,206 @@ class Bot(discord.Client):
                 return
             for chunk in split_message(text):
                 await inter.followup.send(chunk, ephemeral=True)
+
+        rec_group = app_commands.Group(
+            name="record", description="Record a voice channel into meeting notes"
+        )
+        tree.add_command(rec_group)
+
+        @rec_group.command(name="start", description="Record the voice channel you are in")
+        async def rec_start(inter: discord.Interaction) -> None:
+            if not await self._gate(inter):
+                return
+            voice = getattr(inter.user, "voice", None)
+            if voice is None or voice.channel is None:
+                await inter.response.send_message("Join a voice channel first.", ephemeral=True)
+                return
+            if self._rec is not None:
+                await inter.response.send_message(
+                    f"Already recording <#{self._rec.channel.id}>.", ephemeral=True
+                )
+                return
+            await inter.response.defer()
+            try:
+                await self._start_recording(voice.channel, inter.user, inter.channel_id or 0)
+            except Exception as e:  # noqa: BLE001
+                log.exception("could not start recording")
+                await inter.followup.send(_trim(f"❌ Could not start recording: {e}"))
+                return
+            await inter.followup.send(
+                f"🔴 Recording <#{voice.channel.id}>. `/record stop` when you are done; I also stop "
+                f"when everyone leaves or after {self.cfg.meetings.max_minutes} minutes. Notes, "
+                "decisions and suggested tasks follow once it is transcribed."
+            )
+
+        @rec_group.command(name="stop", description="Stop recording and write the meeting notes")
+        async def rec_stop(inter: discord.Interaction) -> None:
+            if not await self._gate(inter):
+                return
+            if self._rec is None:
+                await inter.response.send_message("Not recording.", ephemeral=True)
+                return
+            await inter.response.defer(ephemeral=True)
+            await self._stop_recording(
+                f"stopped by {self._person(inter.user)}", status_channel_id=inter.channel_id
+            )
+            await inter.followup.send("⏹ Stopped. Transcribing now.", ephemeral=True)
+
+        @rec_group.command(name="status", description="Is anything being recorded?")
+        async def rec_status(inter: discord.Interaction) -> None:
+            rec = self._rec
+            if rec is None:
+                await inter.response.send_message("Not recording.", ephemeral=True)
+                return
+            speakers = ", ".join(t.name for t in rec.writer.tracks.values()) or "nobody yet"
+            await inter.response.send_message(
+                f"🔴 Recording <#{rec.channel.id}> for {rec.writer.elapsed() / 60:.0f} min, "
+                f"started by {rec.requested_by}. Heard: {speakers}.",
+                ephemeral=True,
+            )
+
+        task_group = app_commands.Group(name="task", description="Team to-dos")
+        tree.add_command(task_group)
+
+        @task_group.command(name="add", description="Add a task")
+        @app_commands.describe(
+            title="What needs doing",
+            assignee="Who owns it (default: nobody)",
+            due="When: 2026-09-12, 9/12, today, tomorrow, fri, next week, in 3 days",
+            notes="Details or a link",
+        )
+        async def task_add(
+            inter: discord.Interaction,
+            title: str,
+            assignee: discord.Member | None = None,
+            due: str | None = None,
+            notes: str | None = None,
+        ) -> None:
+            if not await self._gate(inter):
+                return
+            try:
+                due_d = parse_due(due, self._today())
+            except ValueError as e:
+                await inter.response.send_message(f"❌ {e}", ephemeral=True)
+                return
+            await inter.response.defer(ephemeral=True)
+            tid = self.pipeline.state.add_task(
+                title=title.strip(),
+                notes=notes,
+                assignee_id=assignee.id if assignee else None,
+                assignee_name=self._person(assignee) if assignee else None,
+                due=due_d.isoformat() if due_d else None,
+                created_by_id=inter.user.id,
+                created_by=self._person(inter.user),
+            )
+            task = self._task(tid)
+            assert task is not None
+            task = await self._post_card(task, inter.channel_id)
+            await self._after_task_change(task)
+            where = f" · <#{self.cfg.tasks.channel_id}>" if self.cfg.tasks.channel_id else ""
+            await inter.followup.send(f"✅ Added task #{tid}{where}", ephemeral=True)
+
+        @task_group.command(name="done", description="Mark a task done")
+        @app_commands.describe(id="Task number", cancel="Cancel instead of completing")
+        async def task_done(inter: discord.Interaction, id: int, cancel: bool = False) -> None:
+            if not await self._gate(inter):
+                return
+            task = self._task(id)
+            if task is None:
+                await inter.response.send_message(f"No task #{id}.", ephemeral=True)
+                return
+            if not task.is_open:
+                await inter.response.send_message(
+                    f"#{id} is already {task.status}.", ephemeral=True
+                )
+                return
+            await inter.response.defer(ephemeral=True)
+            task = await self._close_task(
+                task, "cancelled" if cancel else "done", self._person(inter.user)
+            )
+            await inter.followup.send(
+                f"{'✖️' if cancel else '✅'} #{id} {task.title} — {task.status}.", ephemeral=True
+            )
+
+        @task_group.command(
+            name="update", description="Change a task's title, owner, due date or notes"
+        )
+        @app_commands.describe(
+            id="Task number",
+            title="New title",
+            assignee="New owner",
+            due="New due date, or 'none' to clear",
+            notes="New notes",
+            reopen="Reopen a done or cancelled task",
+        )
+        async def task_update(
+            inter: discord.Interaction,
+            id: int,
+            title: str | None = None,
+            assignee: discord.Member | None = None,
+            due: str | None = None,
+            notes: str | None = None,
+            reopen: bool = False,
+        ) -> None:
+            if not await self._gate(inter):
+                return
+            task = self._task(id)
+            if task is None:
+                await inter.response.send_message(f"No task #{id}.", ephemeral=True)
+                return
+            fields: dict = {}
+            if title:
+                fields["title"] = title.strip()
+            if assignee is not None:
+                fields["assignee_id"] = assignee.id
+                fields["assignee_name"] = self._person(assignee)
+            if due is not None:
+                try:
+                    d = parse_due(due, self._today())
+                except ValueError as e:
+                    await inter.response.send_message(f"❌ {e}", ephemeral=True)
+                    return
+                fields["due"] = d.isoformat() if d else None
+            if notes is not None:
+                fields["notes"] = notes
+            if reopen:
+                fields["status"] = "open"
+                fields["done_at"] = None
+            if not fields:
+                await inter.response.send_message(f"Nothing to change. {DUE_HELP}", ephemeral=True)
+                return
+            await inter.response.defer(ephemeral=True)
+            self.pipeline.state.update_task(id, **fields)
+            task = self._task(id) or task
+            await self._after_task_change(task)
+            await inter.followup.send(f"✅ Updated #{id}: {', '.join(fields)}.", ephemeral=True)
+
+        @task_group.command(name="list", description="Show open tasks")
+        @app_commands.describe(assignee="Only this person's tasks", everyone="Post publicly")
+        async def task_list(
+            inter: discord.Interaction,
+            assignee: discord.Member | None = None,
+            everyone: bool = False,
+        ) -> None:
+            if not await self._gate(inter):
+                return
+            tasks = self._all_tasks()
+            title = "**Open tasks**"
+            if assignee is not None:
+                tasks = [t for t in tasks if t.assignee_id == assignee.id]
+                title = f"**Open tasks for {self._person(assignee)}**"
+            text = render_board(tasks, self._today(), title=title)
+            await inter.response.send_message(_trim(text), ephemeral=not everyone)
+
+        @task_group.command(name="mine", description="Show my open tasks")
+        async def task_mine(inter: discord.Interaction) -> None:
+            if not await self._gate(inter):
+                return
+            tasks = [t for t in self._all_tasks() if t.assignee_id == inter.user.id]
+            text = render_board(
+                tasks, self._today(), title=f"**Open tasks for {self._person(inter.user)}**"
+            )
+            await inter.response.send_message(_trim(text), ephemeral=True)
 
         @tree.command(name="retry", description="Retry a failed drop (paste the message link)")
         async def retry(inter: discord.Interaction, link: str) -> None:

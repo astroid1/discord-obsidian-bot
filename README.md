@@ -137,6 +137,10 @@ archived channel, threads included. After that the bot syncs new messages every
 | `/ask question:` | answer from the vault, citing the notes it used (needs `ANTHROPIC_API_KEY`) |
 | `/decide title: what: [why:] [alternatives:] [decided_by:]` | post a decision card to `decisions_channel_id` and create the decision page |
 | `/digest [days:] [post:]` | week-in-review from the vault; `post:true` sends it to `weekly_digest.channel_id`, which also happens on the configured weekday/hour |
+| `/task add title: [assignee:] [due:] [notes:]` | new to-do; a card lands in `tasks.channel_id` and the pinned board updates |
+| `/task done id:` · `/task update id: …` · `/task list` · `/task mine` | close (or react ✅ on the card), edit, and view tasks; a 9am reminder posts overdue and due-today items |
+| `/record start` · `/record stop` · `/record status` | record the voice channel you are in, one track per speaker; the transcript becomes a recording note with real names (needs the `voice` extra and libopus) |
+| *(automatic)* | action items Claude finds in new notes post to `tasks.channel_id` as suggestion cards: ✅ puts one on the board, ❌ dismisses it |
 | `/ingest url:` | ingest a link from anywhere |
 | `/retry link:` / `/reingest link:` | rerun a failed drop, or force a re-run of a done one |
 | `/status` | queue, ledger counts, archive cursors |

@@ -53,6 +53,19 @@ ask:
   budget_chars: 120000
   note_chars: 12000
 
+# /task board: cards, the pinned open-task list and the morning reminder go here.
+tasks:
+  channel_id: 123456789012345678   # #tasks
+  reminder_hour: 9                 # daily, in `timezone`, only when something is due or overdue
+  reminder_weekdays_only: true
+  suggest_from_notes: true   # action items in new notes become ✅/❌ suggestion cards
+  suggest_max_per_note: 8
+
+# Meeting capture: /record start|stop|status in a voice channel. One Whisper track per speaker.
+meetings:
+  max_minutes: 180
+  announce: true       # tell the voice channel it is being recorded (all-party consent states!)
+
 # Scheduled week-in-review post. Leave channel_id unset to disable. /digest builds one on demand.
 weekly_digest:
   channel_id: 123456789012345678   # #announcements

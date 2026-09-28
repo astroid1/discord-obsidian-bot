@@ -33,13 +33,17 @@ class Transcript:
 
 
 class Transcriber(Protocol):
-    async def transcribe(self, wav: Path, *, progress: ProgressFn | None = None) -> Transcript: ...
+    async def transcribe(
+        self, wav: Path, *, progress: ProgressFn | None = None, diarize: bool | None = None
+    ) -> Transcript: ...
 
 
 class FakeTranscriber:
     """Offline stand-in: returns three fixed segments with two speakers."""
 
-    async def transcribe(self, wav: Path, *, progress: ProgressFn | None = None) -> Transcript:
+    async def transcribe(
+        self, wav: Path, *, progress: ProgressFn | None = None, diarize: bool | None = None
+    ) -> Transcript:
         if progress:
             progress(1.0, "fake")
         segs = [
@@ -147,12 +151,16 @@ class FasterWhisperTranscriber:
 
     # --- work --------------------------------------------------------------------------
 
-    async def transcribe(self, wav: Path, *, progress: ProgressFn | None = None) -> Transcript:
+    async def transcribe(
+        self, wav: Path, *, progress: ProgressFn | None = None, diarize: bool | None = None
+    ) -> Transcript:
         import asyncio
 
-        return await asyncio.to_thread(self._transcribe_sync, wav, progress)
+        return await asyncio.to_thread(self._transcribe_sync, wav, progress, diarize)
 
-    def _transcribe_sync(self, wav: Path, progress: ProgressFn | None) -> Transcript:
+    def _transcribe_sync(
+        self, wav: Path, progress: ProgressFn | None, diarize: bool | None = None
+    ) -> Transcript:
         model = self._whisper()
         seg_iter, info = model.transcribe(
             str(wav),
@@ -168,7 +176,7 @@ class FasterWhisperTranscriber:
             if progress and duration:
                 progress(min(0.9, s.end / duration), f"{int(s.end) // 60}:{int(s.end) % 60:02d}")
         speakers: list[str] = []
-        if segments and self._diarizer() is not None:
+        if segments and diarize is not False and self._diarizer() is not None:
             if progress:
                 progress(0.9, "diarizing")
             speakers = self._assign_speakers(wav, segments)

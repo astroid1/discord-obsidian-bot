@@ -77,7 +77,41 @@ CREATE TABLE IF NOT EXISTS kv (
   key TEXT PRIMARY KEY,
   value TEXT
 );
+
+CREATE TABLE IF NOT EXISTS tasks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  title TEXT NOT NULL,
+  notes TEXT,
+  assignee_id INTEGER,
+  assignee_name TEXT,
+  due TEXT,
+  status TEXT NOT NULL DEFAULT 'open',
+  created_by_id INTEGER,
+  created_by TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  done_at TEXT,
+  message_id INTEGER,
+  source_url TEXT,
+  source_note TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_tasks_status ON tasks(status, due);
 """
+
+TASK_COLUMNS = frozenset(
+    [
+        "title",
+        "notes",
+        "assignee_id",
+        "assignee_name",
+        "due",
+        "status",
+        "done_at",
+        "message_id",
+        "source_url",
+        "source_note",
+    ]
+)
 
 
 def _now() -> str:
@@ -93,6 +127,15 @@ class State:
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA synchronous=NORMAL")
         self._db.executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Additive column changes for databases created by older versions."""
+        with self._lock:
+            cols = {r[1] for r in self._db.execute("PRAGMA table_info(tasks)").fetchall()}
+            if "source_note" not in cols:
+                self._db.execute("ALTER TABLE tasks ADD COLUMN source_note TEXT")
+            self._db.execute("CREATE INDEX IF NOT EXISTS ix_tasks_note ON tasks(source_note)")
 
     def close(self) -> None:
         with self._lock:
@@ -360,3 +403,88 @@ class State:
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 (key, value),
             )
+
+    # --- tasks ----------------------------------------------------------------------
+
+    def add_task(
+        self,
+        *,
+        title: str,
+        notes: str | None = None,
+        assignee_id: int | None = None,
+        assignee_name: str | None = None,
+        due: str | None = None,
+        created_by_id: int | None = None,
+        created_by: str | None = None,
+        source_url: str | None = None,
+        status: str = "open",
+        source_note: str | None = None,
+    ) -> int:
+        now = _now()
+        with self._lock:
+            cur = self._db.execute(
+                """INSERT INTO tasks(title, notes, assignee_id, assignee_name, due, status,
+                       created_by_id, created_by, created_at, updated_at, source_url,
+                       source_note)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    title,
+                    notes,
+                    assignee_id,
+                    assignee_name,
+                    due,
+                    status,
+                    created_by_id,
+                    created_by,
+                    now,
+                    now,
+                    source_url,
+                    source_note,
+                ),
+            )
+        return int(cur.lastrowid or 0)
+
+    def task_exists(self, source_note: str, title: str) -> bool:
+        """True if a task with this title was already created from this note."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT 1 FROM tasks WHERE source_note=? AND lower(title)=lower(?) LIMIT 1",
+                (source_note, title),
+            ).fetchone()
+        return row is not None
+
+    def get_task(self, task_id: int) -> sqlite3.Row | None:
+        with self._lock:
+            return self._db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+
+    def task_by_message(self, message_id: int) -> sqlite3.Row | None:
+        with self._lock:
+            return self._db.execute(
+                "SELECT * FROM tasks WHERE message_id=?", (message_id,)
+            ).fetchone()
+
+    def update_task(self, task_id: int, **fields) -> None:
+        bad = set(fields) - TASK_COLUMNS
+        if bad:
+            raise ValueError(f"unknown task field(s): {sorted(bad)}")
+        sets = [f"{k}=?" for k in fields] + ["updated_at=?"]
+        args = [*fields.values(), _now(), task_id]
+        with self._lock:
+            self._db.execute(f"UPDATE tasks SET {', '.join(sets)} WHERE id=?", args)
+
+    def list_tasks(
+        self, *, status: str | None = None, assignee_id: int | None = None
+    ) -> list[sqlite3.Row]:
+        where, args = [], []
+        if status:
+            where.append("status=?")
+            args.append(status)
+        if assignee_id is not None:
+            where.append("assignee_id=?")
+            args.append(assignee_id)
+        sql = "SELECT * FROM tasks"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY (due IS NULL), due, id"
+        with self._lock:
+            return self._db.execute(sql, args).fetchall()

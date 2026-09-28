@@ -9,7 +9,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     TZ=UTC
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        software-properties-common ca-certificates curl git ffmpeg tzdata \
+        software-properties-common ca-certificates curl git ffmpeg tzdata libopus0 \
     && add-apt-repository -y ppa:deadsnakes/ppa \
     && apt-get update && apt-get install -y --no-install-recommends \
         python3.12 python3.12-venv python3.12-dev \
@@ -29,7 +29,7 @@ RUN mkdir -p src/dob && touch src/dob/__init__.py
 ARG TORCH_INDEX=https://download.pytorch.org/whl/cu126
 RUN pip install -U pip \
     && pip install --index-url ${TORCH_INDEX} torch torchaudio torchcodec \
-    && pip install --extra-index-url ${TORCH_INDEX} -e ".[gpu]"
+    && pip install --extra-index-url ${TORCH_INDEX} -e ".[gpu,voice]"
 
 # Real source last: code changes only rebuild from here.
 COPY src ./src

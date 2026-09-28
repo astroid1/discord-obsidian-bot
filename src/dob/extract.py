@@ -96,6 +96,9 @@ def default_registry(
         from .extract_media import register_media
 
         register_media(reg, transcriber=transcriber, cfg=cfg)
+        from .record import MeetingExtractor
+
+        reg.register_source("meeting", MeetingExtractor(transcriber))
     if state is not None and bot_cfg is not None:
         from .chat import ChatDayExtractor
 

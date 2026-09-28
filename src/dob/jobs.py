@@ -88,6 +88,8 @@ class JobQueue:
         self._seq = itertools.count()
         self._worker: asyncio.Task | None = None
         self.current: IngestItem | None = None
+        # Called after a job finishes with status 'done' (suggested tasks, meeting cleanup).
+        self.on_result = None
 
     def start(self) -> None:
         if self._worker is None:
@@ -151,3 +153,8 @@ class JobQueue:
                 asyncio.get_running_loop().call_later(delay, self._q.put_nowait, job)
             return
         await job.sink.done(result)
+        if self.on_result is not None and result.status == "done":
+            try:
+                await self.on_result(job.item, result)
+            except Exception:  # noqa: BLE001 - a hook must never break the worker
+                log.exception("on_result hook failed for %s", job.item.original_name)

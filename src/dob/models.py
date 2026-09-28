@@ -13,7 +13,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-SourceKind = Literal["discord_attachment", "discord_url", "inbox", "chat_day"]
+SourceKind = Literal["discord_attachment", "discord_url", "inbox", "chat_day", "meeting"]
 NoteKind = Literal["recording", "memo", "document", "chat-digest"]
 EntityKind = Literal["person", "project", "topic"]
 
@@ -142,6 +142,8 @@ class WrittenNote(BaseModel):
     entities_updated: list[str] = Field(default_factory=list)
     decisions_created: list[str] = Field(default_factory=list)
     commit_sha: str | None = None
+    kind: str = ""  # recording | memo | document | chat-digest
+    action_items: list[ActionItemOut] = Field(default_factory=list)
 
 
 class RunResult(BaseModel):

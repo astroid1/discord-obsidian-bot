@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- `/record start|stop|status`: capture a voice channel with discord-ext-voice-recv, one PCM track
+  per speaker on a shared timeline, DAVE (end-to-end encrypted voice) frames decrypted through the
+  connection's davey session. Each track is transcribed alone and merged, so speaker labels are
+  real names. Auto-stops when the channel empties or after `meetings.max_minutes`.
+- Suggested tasks: action items from every new note become cards in the tasks channel that are
+  accepted with ✅ or dismissed with ❌; owners map to Discord users via `people`, and a note never
+  suggests the same task twice.
+- New `voice` extra; the Docker image installs it plus libopus.
+- `/task` group (`add`, `done`, `update`, `list`, `mine`): to-dos with owners and due dates in a
+  `tasks` table. Cards post to `tasks.channel_id`, a pinned board stays current, a ✅ reaction
+  closes a card, a weekday-morning reminder lists overdue and due-today items, and the vault gets
+  a generated `tasks/Tasks.md`. Open tasks are appended to the weekly digest.
 - `/ask`: keyword retrieval over the vault plus a Claude answer that cites the notes it used.
 - `/decide`: records a decision as a card in the decisions channel and a page in `decisions/`;
   the same title again appends a "Reaffirmed" mention instead of a duplicate page.

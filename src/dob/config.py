@@ -75,6 +75,27 @@ class WeeklyDigestConfig(BaseModel):
     days: int = Field(default=7, ge=1, le=60)
 
 
+class TasksConfig(BaseModel):
+    """`/task` board. Cards and reminders go to `channel_id`; disabled until it is set."""
+
+    channel_id: int | None = None
+    reminder_hour: int = Field(default=9, ge=0, le=23)  # in `timezone`; daily, only if due/overdue
+    reminder_weekdays_only: bool = True
+    # Action items Claude finds in new notes become suggested cards (✅ accept, ❌ dismiss).
+    suggest_from_notes: bool = True
+    suggest_kinds: list[str] = Field(
+        default_factory=lambda: ["recording", "memo", "document", "chat-digest"]
+    )
+    suggest_max_per_note: int = Field(default=8, ge=1, le=25)
+
+
+class MeetingsConfig(BaseModel):
+    """`/record`: voice-channel capture. Needs the `voice` extra and libopus."""
+
+    max_minutes: int = Field(default=180, ge=1, le=600)
+    announce: bool = True  # post a recording notice in the voice channel's chat
+
+
 class BotConfig(BaseModel):
     """Server-specific configuration from config.yaml. Contains IDs, never secrets."""
 
@@ -93,6 +114,8 @@ class BotConfig(BaseModel):
     decisions_channel_id: int | None = None  # where /decide posts (default: where it was run)
     ask: AskConfig = Field(default_factory=AskConfig)
     weekly_digest: WeeklyDigestConfig = Field(default_factory=WeeklyDigestConfig)
+    tasks: TasksConfig = Field(default_factory=TasksConfig)
+    meetings: MeetingsConfig = Field(default_factory=MeetingsConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)
     transcription: TranscriptionConfig = Field(default_factory=TranscriptionConfig)
     vault: VaultConfig = Field(default_factory=VaultConfig)

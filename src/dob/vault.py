@@ -35,7 +35,14 @@ KIND_FOLDER = {
     "chat-digest": "sources/chat-digests",
 }
 ENTITY_FOLDER = {"person": "people", "project": "projects", "topic": "topics"}
-FOLDERS = [*KIND_FOLDER.values(), "chat", *ENTITY_FOLDER.values(), "decisions", "attachments"]
+FOLDERS = [
+    *KIND_FOLDER.values(),
+    "chat",
+    *ENTITY_FOLDER.values(),
+    "decisions",
+    "attachments",
+    "tasks",
+]
 MEDIA_EXT = {
     ".mp3", ".wav", ".m4a", ".ogg", ".oga", ".flac", ".opus", ".aac", ".wma",
     ".mp4", ".mkv", ".mov", ".webm", ".avi",
@@ -218,7 +225,13 @@ class VaultWriter:
         title = safe_name(out.suggested_title or item.original_name, 60)
         note_path = self._note_path(extracted, title, when)
         note_link = self.to_link(self.rel(note_path))
-        result = WrittenNote(note_path=self.rel(note_path), link=note_link, title=title)
+        result = WrittenNote(
+            note_path=self.rel(note_path),
+            link=note_link,
+            title=title,
+            kind=extracted.kind,
+            action_items=list(out.action_items),
+        )
 
         # 1. entities
         resolved: dict[tuple[str, str], _Resolved] = {}
@@ -322,6 +335,18 @@ class VaultWriter:
         self.regenerate_home()
         self.commit(f"decision: {title}")
         return self.rel(path), True
+
+    # --- generated tasks page (used by bot.py) -----------------------------------------
+
+    def write_tasks_page(self, text: str) -> str:
+        """Overwrite tasks/Tasks.md and commit. Returns the vault-relative path."""
+        self.ensure_layout()
+        p = self.root / "tasks" / "Tasks.md"
+        if p.exists() and p.read_text(encoding="utf-8") == text:
+            return self.rel(p)
+        p.write_text(text, encoding="utf-8")
+        self.commit("tasks: update board")
+        return self.rel(p)
 
     # --- chat logs (used by chat.py) -----------------------------------------------------
 
