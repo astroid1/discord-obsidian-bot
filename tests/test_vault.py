@@ -45,7 +45,9 @@ def _structured(**kw):
         ],
         decisions=[
             DecisionOut(
-                title="Use Postgres for CRM", statement="Postgres it is.", decided_by=["Jordan Blake"]
+                title="Use Postgres for CRM",
+                statement="Postgres it is.",
+                decided_by=["Jordan Blake"],
             )
         ],
         action_items=[

@@ -64,7 +64,10 @@ async def test_single_call_below_threshold(structurer):
     ctx = KnownContext(
         entities=[
             KnownEntity(
-                type="person", name="Jordan Blake", aliases=["Jordan"], path="people/Jordan Blake.md"
+                type="person",
+                name="Jordan Blake",
+                aliases=["Jordan"],
+                path="people/Jordan Blake.md",
             )
         ]
     )
